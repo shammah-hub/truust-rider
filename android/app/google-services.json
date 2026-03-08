@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "930655856548",
+    "project_id": "truust-a7e77",
+    "storage_bucket": "truust-a7e77.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:930655856548:android:b002c8ca2533368e4d4331",
+        "android_client_info": {
+          "package_name": "com.example.truust"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAwBhBjxY1TzKIvmyy2yZMC_FVnFi5MCm4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:930655856548:android:7d33f20e1685a0684d4331",
+        "android_client_info": {
+          "package_name": "com.example.truust_rider"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAwBhBjxY1TzKIvmyy2yZMC_FVnFi5MCm4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
