@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:truust_rider/core/wdgets/app_loader.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../data/models/delivery_models.dart';
 import '../../../data/repositories/delivery_repository.dart';
@@ -118,6 +119,40 @@ class _JobDetailPageState extends State<JobDetailPage> {
     }
   }
 
+  Future<void> _respondToCounter(bool accept) async {
+    if (_existingBid == null) return;
+    setState(() => _loading = true);
+    try {
+      await context.read<DeliveryRepository>().respondToCounter(
+        bidId: _existingBid!.id,
+        agentId: widget.agentId,
+        accept: accept,
+      );
+      if (mounted) {
+        if (accept) {
+          Navigator.pop(context);
+        } else {
+          await _loadData();
+          setState(() => _loading = false);
+        }
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(accept
+              ? 'Counter accepted! 🎉'
+              : 'Counter declined — your original bid is back open'),
+          backgroundColor: accept ? AppTheme.green : AppTheme.amber,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12)),
+        ));
+      }
+    } catch (e) {
+      setState(() => _loading = false);
+      _showError(accept
+          ? 'Failed to accept counter. Please try again.'
+          : 'Failed to decline counter. Please try again.');
+    }
+  }
+
   void _showError(String msg) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text(msg),
@@ -228,88 +263,223 @@ class _JobDetailPageState extends State<JobDetailPage> {
             const SizedBox(height: 20),
 
             if (_existingBid != null) ...[
-              // Already bid
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: AppTheme.amber.withOpacity(0.08),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(
-                      color: AppTheme.amber.withOpacity(0.3)),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Row(children: [
-                      Icon(Icons.how_to_reg_rounded,
-                          color: AppTheme.amber, size: 18),
-                      SizedBox(width: 8),
-                      Text(
-                        'Your bid is active',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w800,
-                          color: AppTheme.amber,
+              // Already bid — branch on whether the buyer has
+              // countered, or the bid is still sitting as posted.
+              if (_existingBid!.status == 'countered') ...[
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: AppTheme.blue.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                        color: AppTheme.blue.withOpacity(0.3)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Row(children: [
+                        Icon(Icons.reply_rounded,
+                            color: AppTheme.blue, size: 18),
+                        SizedBox(width: 8),
+                        Text(
+                          'Buyer sent a counter offer',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w800,
+                            color: AppTheme.blue,
+                          ),
                         ),
-                      ),
-                    ]),
-                    const SizedBox(height: 8),
-                    Text(
-                      '₦${_existingBid!.currentAmount.toStringAsFixed(0)}',
-                      style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: -1,
-                        color: isDark
-                            ? AppTheme.darkTextPrimary
-                            : AppTheme.lightTextPrimary,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Waiting for buyer to respond...',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: isDark
-                            ? AppTheme.darkTextTertiary
-                            : AppTheme.lightTextTertiary,
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    GestureDetector(
-                      onTap: _loading ? null : _withdrawBid,
-                      child: Container(
-                        width: double.infinity,
-                        height: 44,
-                        decoration: BoxDecoration(
-                          color: AppTheme.error.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(
-                              color: AppTheme.error.withOpacity(0.3)),
-                        ),
-                        child: Center(
-                          child: _loading
-                              ? const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: AppTheme.error),
-                          )
-                              : const Text(
-                            'Withdraw Bid',
+                      ]),
+                      const SizedBox(height: 8),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Text(
+                            '₦${(_existingBid!.counterAmount ?? _existingBid!.amount).toStringAsFixed(0)}',
                             style: TextStyle(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w700,
-                              color: AppTheme.error,
+                              fontSize: 28,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: -1,
+                              color: isDark
+                                  ? AppTheme.darkTextPrimary
+                                  : AppTheme.lightTextPrimary,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 6),
+                            child: Text(
+                              'was ₦${_existingBid!.amount.toStringAsFixed(0)}',
+                              style: TextStyle(
+                                fontSize: 12,
+                                decoration: TextDecoration.lineThrough,
+                                color: isDark
+                                    ? AppTheme.darkTextTertiary
+                                    : AppTheme.lightTextTertiary,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Accept to lock in this job, or decline to keep your original bid open.',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: isDark
+                              ? AppTheme.darkTextTertiary
+                              : AppTheme.lightTextTertiary,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: GestureDetector(
+                              onTap: _loading
+                                  ? null
+                                  : () => _respondToCounter(false),
+                              child: Container(
+                                height: 44,
+                                decoration: BoxDecoration(
+                                  color: AppTheme.error.withOpacity(0.1),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(
+                                      color:
+                                      AppTheme.error.withOpacity(0.3)),
+                                ),
+                                child: const Center(
+                                  child: Text(
+                                    'Decline',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w700,
+                                      color: AppTheme.error,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: GestureDetector(
+                              onTap: _loading
+                                  ? null
+                                  : () => _respondToCounter(true),
+                              child: Container(
+                                height: 44,
+                                decoration: BoxDecoration(
+                                  color: AppTheme.green,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Center(
+                                  child: _loading
+                                      ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white),
+                                  )
+                                      : const Text(
+                                    'Accept',
+                                    style: TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ] else ...[
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: AppTheme.amber.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                        color: AppTheme.amber.withOpacity(0.3)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Row(children: [
+                        Icon(Icons.how_to_reg_rounded,
+                            color: AppTheme.amber, size: 18),
+                        SizedBox(width: 8),
+                        Text(
+                          'Your bid is active',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w800,
+                            color: AppTheme.amber,
+                          ),
+                        ),
+                      ]),
+                      const SizedBox(height: 8),
+                      Text(
+                        '₦${_existingBid!.currentAmount.toStringAsFixed(0)}',
+                        style: TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: -1,
+                          color: isDark
+                              ? AppTheme.darkTextPrimary
+                              : AppTheme.lightTextPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Waiting for buyer to respond...',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: isDark
+                              ? AppTheme.darkTextTertiary
+                              : AppTheme.lightTextTertiary,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      GestureDetector(
+                        onTap: _loading ? null : _withdrawBid,
+                        child: Container(
+                          width: double.infinity,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            color: AppTheme.error.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(92),
+                            border: Border.all(
+                                color: AppTheme.error.withOpacity(0.3)),
+                          ),
+                          child: Center(
+                            child: _loading
+                                ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: AppLoader(),
+                            )
+                                : const Text(
+                              'Withdraw Bid',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                                color: AppTheme.error,
+                              ),
                             ),
                           ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
+              ],
             ] else ...[
               // Place bid form
               Text(
@@ -362,45 +532,50 @@ class _JobDetailPageState extends State<JobDetailPage> {
 
               const SizedBox(height: 20),
 
-              GestureDetector(
-                onTap: _loading ? null : _placeBid,
-                child: Container(
-                  width: double.infinity,
-                  height: 54,
-                  decoration: BoxDecoration(
-                    gradient: AppTheme.primaryGradient,
-                    borderRadius: BorderRadius.circular(16),
-                    boxShadow: [
-                      BoxShadow(
-                        color: AppTheme.blue.withOpacity(0.35),
-                        blurRadius: 16,
-                        offset: const Offset(0, 6),
-                      )
-                    ],
+              SizedBox(
+                width: double.infinity,
+                height: 54,
+                child: ElevatedButton(
+                  onPressed: _loading ? null : _placeBid,
+                  style: ElevatedButton.styleFrom(
+                    padding: EdgeInsets.zero,
+                    elevation: 0,
+                    shadowColor: Colors.transparent,
+                    shape: const StadiumBorder(),
                   ),
-                  child: Center(
-                    child: _loading
-                        ? const SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(
-                          strokeWidth: 2.5, color: Colors.white),
-                    )
-                        : const Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.gavel_rounded,
-                            color: Colors.white, size: 18),
-                        SizedBox(width: 8),
-                        Text(
-                          'Place Bid',
-                          style: TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.w800,
-                            color: Colors.white,
+                  child: Ink(
+                    decoration: const BoxDecoration(
+                      gradient: AppTheme.primaryGradient,
+                      shape: BoxShape.rectangle,
+                      borderRadius: BorderRadius.all(Radius.circular(100)),
+                    ),
+                    child: Container(
+                      alignment: Alignment.center,
+                      width: double.infinity,
+                      height: 54,
+                      child: _loading
+                          ? const SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2.5, color: Colors.white),
+                      )
+                          : const Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.gavel_rounded,
+                              color: Colors.white, size: 18),
+                          SizedBox(width: 8),
+                          Text(
+                            'Place Bid',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),

@@ -1,7 +1,13 @@
+import 'dart:io';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:iconsax/iconsax.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:uuid/uuid.dart';
+import '../../../constants/delivery_cities.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../data/models/delivery_models.dart';
 import '../../../data/repositories/delivery_repository.dart';
@@ -10,9 +16,11 @@ import '../../../navigation/main_navigation.dart';
 // ═══════════════════════════════════════════════════════════════
 //  AGENT SETUP PAGE
 //
-//  Step 1 — Personal details (name, city)
+//  Step 1 — Personal details (name, city, optional agency code)
 //  Step 2 — Add vehicles (can add multiple)
-//  Step 3 — Pending verification screen
+//  Step 3 — Guarantors
+//  Step 4 — Verification documents (ID, selfie, rider's permit,
+//           AMAC registration, bike + plate photo)
 // ═══════════════════════════════════════════════════════════════
 
 class AgentSetupPage extends StatefulWidget {
@@ -25,27 +33,133 @@ class AgentSetupPage extends StatefulWidget {
 
 class _AgentSetupPageState extends State<AgentSetupPage> {
   final _nameCtrl = TextEditingController();
+  final _emailCtrl = TextEditingController();
+  final _addressCtrl = TextEditingController();
   final _cityCtrl = TextEditingController();
+  final _agencyCodeCtrl = TextEditingController();
 
-  int _step = 0; // 0=personal, 1=vehicles, 2=pending
+  final _g1NameCtrl = TextEditingController();
+  final _g1PhoneCtrl = TextEditingController();
+  final _g1RelCtrl = TextEditingController();
+  final _g2NameCtrl = TextEditingController();
+  final _g2PhoneCtrl = TextEditingController();
+  final _g2RelCtrl = TextEditingController();
+
+  int _step = 0; // 0=personal, 1=vehicles, 2=guarantors, 3=verification docs
   bool _loading = false;
   String? _error;
 
   final List<DeliveryVehicle> _vehicles = [];
   final _uuid = const Uuid();
 
+  String _idType = 'drivers_license';
+  File? _idDocument;
+  File? _selfie;
+  File? _riderPermit;
+  File? _amacRegistration;
+  File? _bikeWithPlate;
+
+  // Riders joining through an agency invite code skip guarantors and
+  // document uploads — their agency vouches for them.
+  bool get _viaAgency => _agencyCodeCtrl.text.trim().isNotEmpty;
+  int get _lastStep => _viaAgency ? 1 : 3;
+  String? _agencyName;  // filled in once the backend has checked the code
+  String? _checkedCode; // the code _agencyName belongs to
+
   @override
   void dispose() {
     _nameCtrl.dispose();
+    _emailCtrl.dispose();
+    _addressCtrl.dispose();
     _cityCtrl.dispose();
+    _agencyCodeCtrl.dispose();
+    _g1NameCtrl.dispose();
+    _g1PhoneCtrl.dispose();
+    _g1RelCtrl.dispose();
+    _g2NameCtrl.dispose();
+    _g2PhoneCtrl.dispose();
+    _g2RelCtrl.dispose();
     super.dispose();
   }
 
   bool get _step1Valid =>
       _nameCtrl.text.trim().length >= 2 &&
-          _cityCtrl.text.trim().length >= 2;
+          _emailCtrl.text.trim().contains('@') &&
+          _addressCtrl.text.trim().length >= 5 &&
+          kDeliveryCities.contains(_cityCtrl.text.trim());
 
-  bool get _step2Valid => _vehicles.isNotEmpty;
+  // Agency riders can skip this: the agency may be the one giving them the bike.
+  bool get _step2Valid => _viaAgency || _vehicles.isNotEmpty;
+
+  // Only the first guarantor is required — a second is optional
+  // but if any of its fields are filled, all three must be, so we
+  // never save a half-complete second guarantor.
+  bool get _currentStepValid {
+    switch (_step) {
+      case 0: return _step1Valid;
+      case 1: return _step2Valid;
+      case 2: return _step3Valid;
+      default: return _step4Valid;
+    }
+  }
+
+  bool get _step3Valid {
+    final g1Complete = _g1NameCtrl.text.trim().isNotEmpty &&
+        _g1PhoneCtrl.text.trim().length >= 10 &&
+        _g1RelCtrl.text.trim().isNotEmpty;
+    final g2Started = _g2NameCtrl.text.trim().isNotEmpty ||
+        _g2PhoneCtrl.text.trim().isNotEmpty ||
+        _g2RelCtrl.text.trim().isNotEmpty;
+    final g2Complete = _g2NameCtrl.text.trim().isNotEmpty &&
+        _g2PhoneCtrl.text.trim().length >= 10 &&
+        _g2RelCtrl.text.trim().isNotEmpty;
+    return g1Complete && (!g2Started || g2Complete);
+  }
+
+  bool get _step4Valid =>
+      _idDocument != null &&
+          _selfie != null &&
+          _riderPermit != null &&
+          _amacRegistration != null &&
+          _bikeWithPlate != null;
+
+  // Step 1 -> 2. If an invite code was typed, check it with the backend first
+  // so a wrong or inactive code is caught right here.
+  Future<void> _continueFromPersonal() async {
+    HapticFeedback.lightImpact();
+    final code = _agencyCodeCtrl.text.trim();
+    if (code.isEmpty) {
+      setState(() {
+        _agencyName = null;
+        _checkedCode = null;
+        _step = 1;
+      });
+      return;
+    }
+    if (_checkedCode == code && _agencyName != null) {
+      setState(() => _step = 1);
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final name = await context.read<DeliveryRepository>().validateAgencyCode(code);
+      if (!mounted) return;
+      setState(() {
+        _agencyName = name;
+        _checkedCode = code;
+        _step = 1;
+      });
+    } catch (e) {
+      debugPrint('validateAgencyCode failed for "$code": $e');
+      if (!mounted) return;
+      setState(() => _error = e.toString().replaceFirst('Exception: ', ''));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
 
   Future<void> _submit() async {
     setState(() {
@@ -53,19 +167,71 @@ class _AgentSetupPageState extends State<AgentSetupPage> {
       _error = null;
     });
 
+    final guarantors = _viaAgency ? <Guarantor>[] : <Guarantor>[
+      Guarantor(
+        name: _g1NameCtrl.text.trim(),
+        phone: _g1PhoneCtrl.text.trim(),
+        relationship: _g1RelCtrl.text.trim(),
+      ),
+      if (_g2NameCtrl.text.trim().isNotEmpty)
+        Guarantor(
+          name: _g2NameCtrl.text.trim(),
+          phone: _g2PhoneCtrl.text.trim(),
+          relationship: _g2RelCtrl.text.trim(),
+        ),
+    ];
+
     try {
       await context.read<DeliveryRepository>().registerAgent(
         userId: widget.userId,
         name: _nameCtrl.text.trim(),
         phone: '',
+        email: _emailCtrl.text.trim(),
+        homeAddress: _addressCtrl.text.trim(),
         city: _cityCtrl.text.trim(),
         vehicles: _vehicles,
+        guarantors: guarantors,
+        idType: _idType,
+        idDocument: _viaAgency ? null : _idDocument,
+        selfie: _viaAgency ? null : _selfie,
+        riderPermit: _viaAgency ? null : _riderPermit,
+        amacRegistration: _viaAgency ? null : _amacRegistration,
+        bikeWithPlate: _viaAgency ? null : _bikeWithPlate,
+        agencyCode: _agencyCodeCtrl.text.trim().isEmpty ? null : _agencyCodeCtrl.text.trim(),
       );
-      setState(() => _step = 2);
-    } catch (e) {
-      setState(() => _error = 'Registration failed. Please try again.');
+      if (mounted) {
+        Navigator.pushAndRemoveUntil(
+          context,
+          MaterialPageRoute(
+            builder: (_) => MainNavigation(userId: widget.userId),
+          ),
+              (route) => false,
+        );
+      }
+    } on FirebaseException catch (e) {
+      debugPrint('registerAgent FirebaseException: ${e.code} — ${e.message}');
+      setState(() => _error = _friendlyFirebaseError(e));
+    } catch (e, st) {
+      debugPrint('registerAgent failed: $e');
+      debugPrint('$st');
+      setState(() => _error = 'Something went wrong. Please try again.');
     } finally {
-      setState(() => _loading = false);
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  String _friendlyFirebaseError(FirebaseException e) {
+    switch (e.code) {
+      case 'not-found':
+        return 'Something went wrong setting up your profile. Please try again.';
+      case 'permission-denied':
+        return 'You don\'t have permission to do this. Please contact support.';
+      case 'unavailable':
+        return 'No internet connection. Please check your network and try again.';
+      case 'unauthenticated':
+        return 'Your session expired. Please log in again.';
+      default:
+        return 'Something went wrong (${e.code}). Please try again.';
     }
   }
 
@@ -88,19 +254,20 @@ class _AgentSetupPageState extends State<AgentSetupPage> {
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final isDark = Theme
+        .of(context)
+        .brightness == Brightness.dark;
 
     return Scaffold(
       backgroundColor: isDark ? AppTheme.darkBg : AppTheme.lightBg,
       body: SafeArea(
-        child: _step == 2
-            ? _PendingScreen(isDark: isDark)
-            : Column(
+        child: Column(
           children: [
             _TopBar(
               step: _step,
-              onBack: _step == 1
-                  ? () => setState(() => _step = 0)
+              total: _viaAgency ? 2 : 4,
+              onBack: _step > 0
+                  ? () => setState(() => _step -= 1)
                   : null,
               isDark: isDark,
             ),
@@ -116,7 +283,11 @@ class _AgentSetupPageState extends State<AgentSetupPage> {
                     Text(
                       _step == 0
                           ? 'Tell us about you'
-                          : 'Your vehicles',
+                          : _step == 1
+                          ? (_viaAgency ? 'Your vehicle' : 'Your vehicles')
+                          : _step == 2
+                          ? 'Guarantors'
+                          : 'Verify your identity',
                       style: TextStyle(
                         fontSize: 28,
                         fontWeight: FontWeight.w900,
@@ -130,7 +301,13 @@ class _AgentSetupPageState extends State<AgentSetupPage> {
                     Text(
                       _step == 0
                           ? 'This is your delivery agent profile'
-                          : 'Add all vehicles you own. More vehicles = more jobs.',
+                          : _step == 1
+                          ? (_viaAgency
+                          ? 'Joining ${_agencyName ?? 'your agency'}. Add the vehicle you ride, or skip this if your agency gives you the bike.'
+                          : 'Add all vehicles you own. More vehicles = more jobs.')
+                          : _step == 2
+                          ? 'At least 1 person we can contact if needed. Kept on file, contacted only if something serious comes up.'
+                          : 'Our team manually reviews these before you can go online.',
                       style: TextStyle(
                         fontSize: 13,
                         color: isDark
@@ -144,17 +321,48 @@ class _AgentSetupPageState extends State<AgentSetupPage> {
                     if (_step == 0)
                       _Step1Personal(
                         nameCtrl: _nameCtrl,
+                        emailCtrl: _emailCtrl,
+                        addressCtrl: _addressCtrl,
                         cityCtrl: _cityCtrl,
+                        agencyCodeCtrl: _agencyCodeCtrl,
                         isDark: isDark,
+                        onChange: () => setState(() {}),
                       )
-                    else
+                    else if (_step == 1)
                       _Step2Vehicles(
                         vehicles: _vehicles,
                         isDark: isDark,
                         onAdd: (type, plate, desc) =>
                             _addVehicle(type, plate, desc),
                         onRemove: _removeVehicle,
-                      ),
+                      )
+                    else if (_step == 2)
+                        _Step3Guarantors(
+                          g1NameCtrl: _g1NameCtrl,
+                          g1PhoneCtrl: _g1PhoneCtrl,
+                          g1RelCtrl: _g1RelCtrl,
+                          g2NameCtrl: _g2NameCtrl,
+                          g2PhoneCtrl: _g2PhoneCtrl,
+                          g2RelCtrl: _g2RelCtrl,
+                          isDark: isDark,
+                          onChange: () => setState(() {}),
+                        )
+                      else
+                        _Step4Verification(
+                          idType: _idType,
+                          idDocument: _idDocument,
+                          selfie: _selfie,
+                          riderPermit: _riderPermit,
+                          amacRegistration: _amacRegistration,
+                          bikeWithPlate: _bikeWithPlate,
+                          isDark: isDark,
+                          onIdTypeChanged: (v) => setState(() => _idType = v),
+                          onIdDocumentPicked: (f) => setState(() => _idDocument = f),
+                          onSelfiePicked: (f) => setState(() => _selfie = f),
+                          onRiderPermitPicked: (f) => setState(() => _riderPermit = f),
+                          onAmacRegistrationPicked: (f) => setState(() => _amacRegistration = f),
+                          onBikeWithPlatePicked: (f) => setState(() => _bikeWithPlate = f),
+                        ),
 
                     if (_error != null) ...[
                       const SizedBox(height: 12),
@@ -171,73 +379,59 @@ class _AgentSetupPageState extends State<AgentSetupPage> {
 
                     const SizedBox(height: 32),
 
-                    // CTA
-                    GestureDetector(
-                      onTap: () {
-                        if (_step == 0 && _step1Valid) {
-                          HapticFeedback.lightImpact();
-                          setState(() => _step = 1);
-                        } else if (_step == 1 &&
-                            _step2Valid &&
-                            !_loading) {
-                          HapticFeedback.mediumImpact();
-                          _submit();
-                        }
-                      },
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 200),
-                        width: double.infinity,
-                        height: 56,
-                        decoration: BoxDecoration(
-                          gradient: (_step == 0
-                              ? _step1Valid
-                              : _step2Valid)
-                              ? AppTheme.primaryGradient
-                              : null,
-                          color: (_step == 0
-                              ? _step1Valid
-                              : _step2Valid)
-                              ? null
-                              : (isDark
-                              ? AppTheme.darkSurface
-                              : AppTheme.lightSurface),
-                          borderRadius: BorderRadius.circular(16),
-                          boxShadow: (_step == 0
-                              ? _step1Valid
-                              : _step2Valid)
-                              ? [
-                            BoxShadow(
-                              color:
-                              AppTheme.blue.withOpacity(0.35),
-                              blurRadius: 16,
-                              offset: const Offset(0, 6),
-                            )
-                          ]
-                              : null,
+                    SizedBox(
+                      width: double.infinity,
+                      height: 56,
+                      child: ElevatedButton(
+                        onPressed: _loading
+                            ? null
+                            : () {
+                          if (_step == 0 && _step1Valid) {
+                            _continueFromPersonal();
+                          } else if (_step == 1 && _step2Valid) {
+                            if (_viaAgency) {
+                              HapticFeedback.mediumImpact();
+                              _submit();
+                            } else {
+                              HapticFeedback.lightImpact();
+                              setState(() => _step = 2);
+                            }
+                          } else if (_step == 2 && _step3Valid) {
+                            HapticFeedback.lightImpact();
+                            setState(() => _step = 3);
+                          } else if (_step == 3 && _step4Valid) {
+                            HapticFeedback.mediumImpact();
+                            _submit();
+                          }
+                        },
+                        style: ElevatedButton.styleFrom(
+                          padding: EdgeInsets.zero,
+                          backgroundColor: Colors.transparent,
+                          elevation: 0,
+                          shape: const StadiumBorder(), // outer shape is the pill
                         ),
-                        child: Center(
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: AppTheme.ink(isDark).withOpacity(_currentStepValid ? 1.0 : 0.3),
+                            borderRadius: BorderRadius.circular(28),
+                          ),
+                          alignment: Alignment.center,
+                          width: double.infinity,
+                          height: 56,
                           child: _loading
-                              ? const SizedBox(
+                              ? SizedBox(
                             width: 22,
                             height: 22,
                             child: CircularProgressIndicator(
                                 strokeWidth: 2.5,
-                                color: Colors.white),
+                                color: AppTheme.inkInverse(isDark)),
                           )
                               : Text(
-                            _step == 0
-                                ? 'Continue'
-                                : 'Submit for Review',
+                            _step < _lastStep ? 'Continue' : (_viaAgency ? 'Join Agency' : 'Submit for Review'),
                             style: TextStyle(
                               fontSize: 15,
                               fontWeight: FontWeight.w800,
-                              color: (_step == 0
-                                  ? _step1Valid
-                                  : _step2Valid)
-                                  ? Colors.white
-                                  : (isDark
-                                  ? AppTheme.darkTextTertiary
-                                  : AppTheme.lightTextTertiary),
+                              color: AppTheme.inkInverse(isDark),
                             ),
                           ),
                         ),
@@ -260,11 +454,12 @@ class _AgentSetupPageState extends State<AgentSetupPage> {
 
 class _TopBar extends StatelessWidget {
   final int step;
+  final int total;
   final VoidCallback? onBack;
   final bool isDark;
 
   const _TopBar(
-      {required this.step, required this.onBack, required this.isDark});
+      {required this.step, required this.total, required this.onBack, required this.isDark});
 
   @override
   Widget build(BuildContext context) {
@@ -296,7 +491,7 @@ class _TopBar extends StatelessWidget {
           ),
           const Spacer(),
           Row(
-            children: List.generate(2, (i) {
+            children: List.generate(total, (i) {
               final isActive = i == step;
               final isDone = i < step;
               return AnimatedContainer(
@@ -329,7 +524,7 @@ class _TopBar extends StatelessWidget {
               Border.all(color: AppTheme.blue.withOpacity(0.3)),
             ),
             child: Text(
-              '${step + 1} of 2',
+              '${step + 1} of $total',
               style: const TextStyle(
                 fontSize: 11,
                 fontWeight: FontWeight.w700,
@@ -349,13 +544,21 @@ class _TopBar extends StatelessWidget {
 
 class _Step1Personal extends StatelessWidget {
   final TextEditingController nameCtrl;
+  final TextEditingController emailCtrl;
+  final TextEditingController addressCtrl;
   final TextEditingController cityCtrl;
+  final TextEditingController agencyCodeCtrl;
   final bool isDark;
+  final VoidCallback onChange;
 
   const _Step1Personal({
     required this.nameCtrl,
+    required this.emailCtrl,
+    required this.addressCtrl,
     required this.cityCtrl,
+    required this.agencyCodeCtrl,
     required this.isDark,
+    required this.onChange,
   });
 
   @override
@@ -371,11 +574,34 @@ class _Step1Personal extends StatelessWidget {
         ),
         const SizedBox(height: 16),
         _Field(
-          controller: cityCtrl,
-          label: 'City',
-          hint: 'Lagos, Abuja, Kano...',
+          controller: emailCtrl,
+          label: 'Email Address',
+          hint: 'emeka@email.com',
           isDark: isDark,
-          capitalization: TextCapitalization.words,
+          keyboardType: TextInputType.emailAddress,
+        ),
+        const SizedBox(height: 16),
+        _Field(
+          controller: addressCtrl,
+          label: 'Home Address',
+          hint: '12 Allen Avenue, Ikeja',
+          isDark: isDark,
+          capitalization: TextCapitalization.sentences,
+        ),
+        const SizedBox(height: 16),
+        _CityField(
+          controller: cityCtrl,
+          isDark: isDark,
+          onChange: onChange,
+        ),
+        const SizedBox(height: 16),
+        _Field(
+          controller: agencyCodeCtrl,
+          label: 'Agency Invite Code (optional)',
+          hint: 'Only if a fleet agency gave you one',
+          isDark: isDark,
+          capitalization: TextCapitalization.none,
+          onChanged: onChange,
         ),
         const SizedBox(height: 20),
         Container(
@@ -387,8 +613,7 @@ class _Step1Personal extends StatelessWidget {
           ),
           child: const Row(
             children: [
-              Icon(Icons.info_outline_rounded,
-                  color: AppTheme.blue, size: 16),
+              Icon(Iconsax.info_circle, color: AppTheme.blue, size: 16),
               SizedBox(width: 10),
               Expanded(
                 child: Text(
@@ -732,6 +957,508 @@ class _VehicleTypeCardState extends State<_VehicleTypeCard> {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  STEP 3 — GUARANTORS
+// ─────────────────────────────────────────────────────────────
+
+class _Step3Guarantors extends StatelessWidget {
+  final TextEditingController g1NameCtrl;
+  final TextEditingController g1PhoneCtrl;
+  final TextEditingController g1RelCtrl;
+  final TextEditingController g2NameCtrl;
+  final TextEditingController g2PhoneCtrl;
+  final TextEditingController g2RelCtrl;
+  final bool isDark;
+  final VoidCallback onChange;
+
+  const _Step3Guarantors({
+    required this.g1NameCtrl,
+    required this.g1PhoneCtrl,
+    required this.g1RelCtrl,
+    required this.g2NameCtrl,
+    required this.g2PhoneCtrl,
+    required this.g2RelCtrl,
+    required this.isDark,
+    required this.onChange,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _GuarantorGroup(
+          title: 'Guarantor 1 (required)',
+          nameCtrl: g1NameCtrl,
+          phoneCtrl: g1PhoneCtrl,
+          relCtrl: g1RelCtrl,
+          isDark: isDark,
+          onChange: onChange,
+        ),
+        const SizedBox(height: 20),
+        _GuarantorGroup(
+          title: 'Guarantor 2 (optional)',
+          nameCtrl: g2NameCtrl,
+          phoneCtrl: g2PhoneCtrl,
+          relCtrl: g2RelCtrl,
+          isDark: isDark,
+          onChange: onChange,
+        ),
+      ],
+    );
+  }
+}
+
+class _GuarantorGroup extends StatelessWidget {
+  final String title;
+  final TextEditingController nameCtrl;
+  final TextEditingController phoneCtrl;
+  final TextEditingController relCtrl;
+  final bool isDark;
+  final VoidCallback onChange;
+
+  const _GuarantorGroup({
+    required this.title,
+    required this.nameCtrl,
+    required this.phoneCtrl,
+    required this.relCtrl,
+    required this.isDark,
+    required this.onChange,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w800,
+            color: isDark ? AppTheme.darkTextPrimary : AppTheme.lightTextPrimary,
+          ),
+        ),
+        const SizedBox(height: 10),
+        _Field(
+          controller: nameCtrl,
+          label: 'Full Name',
+          hint: 'Full name',
+          isDark: isDark,
+          capitalization: TextCapitalization.words,
+          onChanged: onChange,
+        ),
+        const SizedBox(height: 10),
+        _Field(
+          controller: phoneCtrl,
+          label: 'Phone Number',
+          hint: '08012345678',
+          isDark: isDark,
+          keyboardType: TextInputType.phone,
+          onChanged: onChange,
+        ),
+        const SizedBox(height: 10),
+        _Field(
+          controller: relCtrl,
+          label: 'Relationship',
+          hint: 'e.g. Brother, Employer, Pastor',
+          isDark: isDark,
+          capitalization: TextCapitalization.words,
+          onChanged: onChange,
+        ),
+      ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  STEP 4 — VERIFICATION DOCUMENTS
+//  Manually reviewed by admin today. Structured so an automated
+//  provider (Smile ID) can slot in later — the upload/capture UX
+//  stays identical either way; only what happens after submit
+//  (human review vs API call) would change.
+//
+//  Local-compliance documents (rider's permit, AMAC registration,
+//  bike + plate photo) follow the same manual-review model — no
+//  verification API exists for these, so they're reviewed by the
+//  same human who checks the ID/selfie match.
+// ─────────────────────────────────────────────────────────────
+
+class _Step4Verification extends StatelessWidget {
+  final String idType;
+  final File? idDocument;
+  final File? selfie;
+  final File? riderPermit;
+  final File? amacRegistration;
+  final File? bikeWithPlate;
+  final bool isDark;
+  final ValueChanged<String> onIdTypeChanged;
+  final ValueChanged<File> onIdDocumentPicked;
+  final ValueChanged<File> onSelfiePicked;
+  final ValueChanged<File> onRiderPermitPicked;
+  final ValueChanged<File> onAmacRegistrationPicked;
+  final ValueChanged<File> onBikeWithPlatePicked;
+
+  const _Step4Verification({
+    required this.idType,
+    required this.idDocument,
+    required this.selfie,
+    required this.riderPermit,
+    required this.amacRegistration,
+    required this.bikeWithPlate,
+    required this.isDark,
+    required this.onIdTypeChanged,
+    required this.onIdDocumentPicked,
+    required this.onSelfiePicked,
+    required this.onRiderPermitPicked,
+    required this.onAmacRegistrationPicked,
+    required this.onBikeWithPlatePicked,
+  });
+
+  Future<void> _pickFromSheet(BuildContext context, ValueChanged<File> onPicked, {int maxWidth = 1600}) {
+    return showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: isDark ? AppTheme.darkSurface : AppTheme.lightSurface,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Iconsax.camera),
+              title: const Text('Take Photo'),
+              onTap: () async {
+                Navigator.pop(ctx);
+                final picked = await ImagePicker().pickImage(
+                  source: ImageSource.camera, imageQuality: 85, maxWidth: maxWidth.toDouble(),
+                );
+                if (picked != null) onPicked(File(picked.path));
+              },
+            ),
+            ListTile(
+              leading: const Icon(Iconsax.gallery),
+              title: const Text('Choose from Gallery'),
+              onTap: () async {
+                Navigator.pop(ctx);
+                final picked = await ImagePicker().pickImage(
+                  source: ImageSource.gallery, imageQuality: 85, maxWidth: maxWidth.toDouble(),
+                );
+                if (picked != null) onPicked(File(picked.path));
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickId(ImageSource source) async {
+    final picked = await ImagePicker().pickImage(
+      source: source,
+      imageQuality: 85,
+      maxWidth: 1600,
+    );
+    if (picked != null) onIdDocumentPicked(File(picked.path));
+  }
+
+  Future<void> _pickSelfie() async {
+    // Front camera preferred for a genuine "hold phone to your own
+    // face" capture rather than a photo of a photo — this is the
+    // same signal a live liveness check would eventually use.
+    final picked = await ImagePicker().pickImage(
+      source: ImageSource.camera,
+      preferredCameraDevice: CameraDevice.front,
+      imageQuality: 85,
+      maxWidth: 1200,
+    );
+    if (picked != null) onSelfiePicked(File(picked.path));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'ID Type',
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: isDark ? AppTheme.darkTextSecondary : AppTheme.lightTextSecondary,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: _IdTypeChip(
+              label: "Driver's License",
+              selected: idType == 'drivers_license',
+              isDark: isDark,
+              onTap: () => onIdTypeChanged('drivers_license'),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _IdTypeChip(
+              label: "Voter's Card",
+              selected: idType == 'voters_card',
+              isDark: isDark,
+              onTap: () => onIdTypeChanged('voters_card'),
+            ),
+          ),
+        ]),
+
+        const SizedBox(height: 22),
+
+        _UploadCard(
+          title: 'ID Document Photo',
+          subtitle: 'Clear photo of the front of your ID',
+          file: idDocument,
+          isDark: isDark,
+          icon: Iconsax.card,
+          onTap: () => _showPickerSheet(context, _pickId),
+        ),
+
+        const SizedBox(height: 16),
+
+        _UploadCard(
+          title: 'Live Selfie',
+          subtitle: 'Take a clear photo of your face — camera only, no gallery',
+          file: selfie,
+          isDark: isDark,
+          icon: Iconsax.user,
+          onTap: _pickSelfie,
+        ),
+
+        const SizedBox(height: 16),
+
+        _UploadCard(
+          title: "Rider's Permit",
+          subtitle: 'Clear photo of your commercial rider\'s permit',
+          file: riderPermit,
+          isDark: isDark,
+          icon: Iconsax.document,
+          onTap: () => _pickFromSheet(context, onRiderPermitPicked),
+        ),
+
+        const SizedBox(height: 16),
+
+        _UploadCard(
+          title: 'AMAC Registration',
+          subtitle: 'Clear photo of your AMAC registration paper',
+          file: amacRegistration,
+          isDark: isDark,
+          icon: Iconsax.document_text,
+          onTap: () => _pickFromSheet(context, onAmacRegistrationPicked),
+        ),
+
+        const SizedBox(height: 16),
+
+        _UploadCard(
+          title: 'Bike & Plate Number',
+          subtitle: 'Photo of your bike, with the plate number clearly visible',
+          file: bikeWithPlate,
+          isDark: isDark,
+          icon: Iconsax.gallery,
+          onTap: () => _pickFromSheet(context, onBikeWithPlatePicked),
+        ),
+
+        const SizedBox(height: 20),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: AppTheme.blue.withOpacity(0.07),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: AppTheme.blue.withOpacity(0.2)),
+          ),
+          child: const Row(children: [
+            Icon(Iconsax.info_circle, color: AppTheme.blue, size: 16),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Our team reviews these manually and compares your selfie to your ID before approving your account.',
+                style: TextStyle(fontSize: 12, color: AppTheme.blue, height: 1.4),
+              ),
+            ),
+          ]),
+        ),
+      ],
+    );
+  }
+
+  void _showPickerSheet(BuildContext context, void Function(ImageSource) onPick) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: isDark ? AppTheme.darkSurface : AppTheme.lightSurface,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Iconsax.camera),
+              title: const Text('Take Photo'),
+              onTap: () {
+                Navigator.pop(ctx);
+                onPick(ImageSource.camera);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Iconsax.gallery),
+              title: const Text('Choose from Gallery'),
+              onTap: () {
+                Navigator.pop(ctx);
+                onPick(ImageSource.gallery);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _IdTypeChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final bool isDark;
+  final VoidCallback onTap;
+
+  const _IdTypeChip({
+    required this.label,
+    required this.selected,
+    required this.isDark,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        decoration: BoxDecoration(
+          color: selected
+              ? AppTheme.blue.withOpacity(0.1)
+              : (isDark ? AppTheme.darkSurface : AppTheme.lightSurface),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: selected
+                ? AppTheme.blue
+                : (isDark ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.08)),
+            width: selected ? 1.5 : 1,
+          ),
+        ),
+        child: Center(
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+              color: selected
+                  ? AppTheme.blue
+                  : (isDark ? AppTheme.darkTextPrimary : AppTheme.lightTextPrimary),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _UploadCard extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final File? file;
+  final bool isDark;
+  final IconData icon;
+  final VoidCallback onTap;
+
+  const _UploadCard({
+    required this.title,
+    required this.subtitle,
+    required this.file,
+    required this.isDark,
+    required this.icon,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final hasFile = file != null;
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: isDark ? AppTheme.darkSurface : AppTheme.lightSurface,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: hasFile
+                ? AppTheme.green.withOpacity(0.4)
+                : (isDark ? Colors.white.withOpacity(0.07) : Colors.black.withOpacity(0.07)),
+            width: hasFile ? 1.5 : 1,
+          ),
+        ),
+        child: Row(children: [
+          if (hasFile)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: Image.file(file!, width: 52, height: 52, fit: BoxFit.cover),
+            )
+          else
+            Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: AppTheme.blue.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(13),
+              ),
+              child: Icon(icon, color: AppTheme.blue, size: 24),
+            ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w800,
+                    color: isDark ? AppTheme.darkTextPrimary : AppTheme.lightTextPrimary,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  hasFile ? 'Tap to retake' : subtitle,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: isDark ? AppTheme.darkTextTertiary : AppTheme.lightTextTertiary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (hasFile)
+            const Icon(Iconsax.tick_circle, color: AppTheme.green, size: 20)
+          else
+            Icon(Icons.chevron_right_rounded,
+                color: isDark ? AppTheme.darkTextTertiary : AppTheme.lightTextTertiary),
+        ]),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 //  PENDING VERIFICATION SCREEN
 // ─────────────────────────────────────────────────────────────
 
@@ -894,6 +1621,76 @@ class _NextStep extends StatelessWidget {
   }
 }
 
+
+class _CityField extends StatelessWidget {
+  final TextEditingController controller;
+  final bool isDark;
+  final VoidCallback onChange;
+
+  const _CityField({
+    required this.controller,
+    required this.isDark,
+    required this.onChange,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'City',
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: isDark ? AppTheme.darkTextSecondary : AppTheme.lightTextSecondary,
+          ),
+        ),
+        const SizedBox(height: 7),
+        Container(
+          decoration: BoxDecoration(
+            color: isDark ? AppTheme.darkSurface2 : AppTheme.lightSurface2,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: isDark ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.08),
+            ),
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 14),
+          child: DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: controller.text.isEmpty ? null : controller.text,
+              isExpanded: true,
+              hint: Text(
+                'Select your city',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w400,
+                  color: isDark ? AppTheme.darkTextTertiary : AppTheme.lightTextTertiary,
+                ),
+              ),
+              icon: Icon(Icons.keyboard_arrow_down_rounded,
+                  color: isDark ? AppTheme.darkTextTertiary : AppTheme.lightTextTertiary),
+              dropdownColor: isDark ? AppTheme.darkSurface2 : AppTheme.lightSurface2,
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+                color: isDark ? AppTheme.darkTextPrimary : AppTheme.lightTextPrimary,
+              ),
+              items: kDeliveryCities
+                  .map((city) => DropdownMenuItem(value: city, child: Text(city)))
+                  .toList(),
+              onChanged: (value) {
+                controller.text = value ?? '';
+                onChange();
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 //  SHARED INPUT FIELD
 // ─────────────────────────────────────────────────────────────
@@ -904,6 +1701,8 @@ class _Field extends StatelessWidget {
   final String hint;
   final bool isDark;
   final TextCapitalization capitalization;
+  final TextInputType? keyboardType;
+  final VoidCallback? onChanged;
 
   const _Field({
     required this.controller,
@@ -911,6 +1710,8 @@ class _Field extends StatelessWidget {
     required this.hint,
     required this.isDark,
     this.capitalization = TextCapitalization.none,
+    this.keyboardType,
+    this.onChanged,
   });
 
   @override
@@ -943,6 +1744,8 @@ class _Field extends StatelessWidget {
           child: TextField(
             controller: controller,
             textCapitalization: capitalization,
+            keyboardType: keyboardType,
+            onChanged: onChanged == null ? null : (_) => onChanged!(),
             style: TextStyle(
               fontSize: 15,
               fontWeight: FontWeight.w600,

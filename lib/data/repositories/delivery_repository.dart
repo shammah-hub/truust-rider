@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:uuid/uuid.dart';
 import '../models/delivery_models.dart';
@@ -11,20 +12,46 @@ abstract class DeliveryRepository {
     required String userId,
     required String name,
     required String phone,
+    required String email,
+    required String homeAddress,
     required String city,
     required List<DeliveryVehicle> vehicles,
+    required List<Guarantor> guarantors,
+    required String idType,
+    // Optional: riders joining through an agency invite code skip the
+    // Truust document checks (their agency vouches for them).
+    File? idDocument,
+    File? selfie,
+    File? riderPermit,
+    File? amacRegistration,
+    File? bikeWithPlate,
+    String? agencyCode,
   });
   Future<DeliveryAgent?> getAgent(String userId);
+  Future<String> validateAgencyCode(String code);
   Future<void> updateAvailability(String userId, bool isAvailable);
   Future<void> addVehicle(String userId, DeliveryVehicle vehicle);
   Future<void> removeVehicle(String userId, String vehicleId);
+  Future<void> updateProfilePhoto(String userId, File photo);
   Stream<DeliveryAgent?> watchAgent(String userId);
 
-  // Jobs
+  // Jobs (Truust marketplace)
   Stream<List<DeliveryJob>> watchAvailableJobs(String agentId);
   Stream<DeliveryJob?> watchJob(String jobId);
   Future<DeliveryJob?> getJob(String jobId);
   Stream<List<DeliveryJob>> watchActiveJobsForAgent(String agentId);
+
+  // Fleet orders (agency's own private dispatch — no bidding, no escrow)
+  Stream<List<FleetOrder>> watchActiveFleetOrdersForAgent(String agentId);
+  Future<void> markFleetOrderInTransit({
+    required String orderId,
+    required String agentId,
+  });
+  Future<void> markFleetOrderDelivered({
+    required String orderId,
+    required String agentId,
+    required File photo,
+  });
 
   // Bidding
   Future<void> placeBid({
@@ -38,10 +65,25 @@ abstract class DeliveryRepository {
     String? note,
   });
   Future<void> withdrawBid(String bidId);
+  Future<void> counterBid({
+    required String jobId,
+    required String bidId,
+    required String buyerId,
+    required double counterAmount,
+  });
+  Future<void> respondToCounter({
+    required String bidId,
+    required String agentId,
+    required bool accept,
+  });
+  Future<void> cancelCounter({
+    required String bidId,
+    required String buyerId,
+  });
   Stream<List<DeliveryBid>> watchBidsForJob(String jobId);
   Future<DeliveryBid?> getMyBidForJob(String jobId, String agentId);
 
-  // Delivery actions
+  // Delivery actions (Truust marketplace)
   Future<void> markPickedUp({
     required String jobId,
     required String agentId,
@@ -76,27 +118,85 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
     required String userId,
     required String name,
     required String phone,
+    required String email,
+    required String homeAddress,
     required String city,
     required List<DeliveryVehicle> vehicles,
+    required List<Guarantor> guarantors,
+    required String idType,
+    // Optional: riders joining through an agency invite code skip the
+    // Truust document checks (their agency vouches for them).
+    File? idDocument,
+    File? selfie,
+    File? riderPermit,
+    File? amacRegistration,
+    File? bikeWithPlate,
+    String? agencyCode,
   }) async {
+    Future<String?> upload(String path, File? file) async {
+      if (file == null) return null;
+      final ref = _storage.ref(path);
+      await ref.putFile(file);
+      return ref.getDownloadURL();
+    }
+
+    final idDocumentUrl = await upload('deliveryAgents/$userId/id_document.jpg', idDocument);
+    final selfieUrl = await upload('deliveryAgents/$userId/selfie.jpg', selfie);
+    final riderPermitUrl = await upload('deliveryAgents/$userId/riders_permit.jpg', riderPermit);
+    final amacRegistrationUrl = await upload('deliveryAgents/$userId/amac_registration.jpg', amacRegistration);
+    final bikeWithPlateUrl = await upload('deliveryAgents/$userId/bike_with_plate.jpg', bikeWithPlate);
+
     await _db.collection('deliveryAgents').doc(userId).set({
       'name': name,
-      'phone': phone,
+      // The setup page passes '' — fall back to the number they signed in with.
+      'phone': phone.isNotEmpty ? phone : (FirebaseAuth.instance.currentUser?.phoneNumber ?? ''),
+      'email': email,
+      'homeAddress': homeAddress,
       'city': city,
-      'isVerified': false, // manually verified by admin
-      'isAvailable': false, // available after verification
+      // Explicit null so an agency's "riders who entered your code" query
+      // (agencyId == null) can find this rider. A missing field wouldn't match.
+      'agencyId': null,
+      'isVerified': false,
+      'isAvailable': false,
       'rating': 5.0,
+      'avgRating': 5.0,
       'totalDeliveries': 0,
       'totalEarnings': 0.0,
       'vehicles': vehicles.map((v) => v.toMap()).toList(),
+      'guarantors': guarantors.map((g) => g.toMap()).toList(),
+      'idType': idType,
+      'idDocumentUrl': idDocumentUrl,
+      'selfieUrl': selfieUrl,
+      'riderPermitUrl': riderPermitUrl,
+      'amacRegistrationUrl': amacRegistrationUrl,
+      'bikeWithPlateUrl': bikeWithPlateUrl,
+      // Agency-vouched riders skip Truust's document review, so they're kept
+      // out of the pending-documents queue.
+      'verificationStatus': (agencyCode != null && agencyCode.trim().isNotEmpty) ? 'agency_vouched' : 'pending',
+      if (agencyCode != null && agencyCode.trim().isNotEmpty) ...{
+        'agencyCodeEntered': agencyCode.trim(),
+        'registeredViaAgency': true,
+      },
       'createdAt': FieldValue.serverTimestamp(),
     });
 
-    // Mark user as delivery agent in users collection
-    await _db.collection('users').doc(userId).update({
+    await _db.collection('users').doc(userId).set({
       'isDeliveryAgent': true,
       'agentCity': city,
-    });
+    }, SetOptions(merge: true));
+  }
+
+  /// Checks an agency invite code with the backend. Returns the agency's
+  /// name, or throws an Exception whose message is safe to show the rider.
+  @override
+  Future<String> validateAgencyCode(String code) async {
+    try {
+      final res = await _fn.httpsCallable('validateAgencyCode').call({'code': code});
+      final data = Map<String, dynamic>.from(res.data as Map);
+      return (data['agencyName'] as String?) ?? 'your agency';
+    } on FirebaseFunctionsException catch (e) {
+      throw Exception(e.message ?? 'Could not check that code. Try again.');
+    }
   }
 
   @override
@@ -142,11 +242,21 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
     });
   }
 
-  // ── Jobs ─────────────────────────────────────────────────
+  @override
+  Future<void> updateProfilePhoto(String userId, File photo) async {
+    final ref = _storage.ref('deliveryAgents/$userId/profile_photo.jpg');
+    await ref.putFile(photo);
+    final url = await ref.getDownloadURL();
+
+    await _db.collection('deliveryAgents').doc(userId).update({
+      'profilePhotoUrl': url,
+    });
+  }
+
+  // ── Jobs (Truust marketplace) ─────────────────────────────
 
   @override
   Stream<List<DeliveryJob>> watchAvailableJobs(String agentId) async* {
-    // Get agent to know what categories they can handle
     final agentDoc =
     await _db.collection('deliveryAgents').doc(agentId).get();
     if (!agentDoc.exists) {
@@ -155,19 +265,25 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
     }
 
     final agent = DeliveryAgent.fromMap(agentId, agentDoc.data()!);
-    final categories =
-    agent.handleableCategories.map((c) => c.name).toList();
-    final city = agent.city;
+
+    if (!agent.isVerified) {
+      yield [];
+      return;
+    }
+
+    final categorySet =
+    agent.handleableCategories.map((c) => c.name).toSet();
+    final cityKey = agent.city.trim().toLowerCase();
 
     yield* _db
         .collection('deliveryJobs')
-        .where('city', isEqualTo: city)
+        .where('cityKey', isEqualTo: cityKey)
         .where('status', whereIn: ['open', 'bidding'])
-        .where('weightCategory', whereIn: categories)
         .orderBy('createdAt', descending: true)
         .snapshots()
         .map((snap) => snap.docs
         .map((doc) => DeliveryJob.fromMap(doc.id, doc.data()))
+        .where((job) => categorySet.contains(job.weightCategory.name))
         .toList());
   }
 
@@ -207,6 +323,51 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
         .toList());
   }
 
+  // ── Fleet orders (agency's own private dispatch) ──────────
+
+
+
+  @override
+  Stream<List<FleetOrder>> watchActiveFleetOrdersForAgent(String agentId) {
+    return _db
+        .collection('fleetOrders')
+        .where('assignedAgentId', isEqualTo: agentId)
+        .where('status', whereIn: ['assigned', 'in_transit'])
+        .orderBy('createdAt', descending: true)
+        .snapshots()
+        .map((snap) => snap.docs
+        .map((doc) => FleetOrder.fromMap(doc.id, doc.data()))
+        .toList());
+  }
+
+  @override
+  Future<void> markFleetOrderInTransit({
+    required String orderId,
+    required String agentId,
+  }) async {
+    await _db.collection('fleetOrders').doc(orderId).update({
+      'status': 'in_transit',
+    });
+  }
+
+  @override
+  Future<void> markFleetOrderDelivered({
+    required String orderId,
+    required String agentId,
+    required File photo,
+  }) async {
+    final ref = _storage.ref('fleetOrders/$orderId/proof.jpg');
+    await ref.putFile(photo);
+    final photoUrl = await ref.getDownloadURL();
+
+    await _db.collection('fleetOrders').doc(orderId).update({
+      'status': 'delivered',
+      'proofPhotoUrl': photoUrl,
+      'proofPhotoUploadedAt': FieldValue.serverTimestamp(),
+      'deliveredAt': FieldValue.serverTimestamp(),
+    });
+  }
+
   // ── Bidding ──────────────────────────────────────────────
 
   @override
@@ -224,7 +385,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
 
     final batch = _db.batch();
 
-    // Create bid
     batch.set(_db.collection('deliveryBids').doc(bidId), {
       'jobId': jobId,
       'agentId': agentId,
@@ -238,7 +398,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
       'createdAt': FieldValue.serverTimestamp(),
     });
 
-    // Update job status to bidding + increment bid count
     batch.update(_db.collection('deliveryJobs').doc(jobId), {
       'status': DeliveryJobStatus.bidding.name,
       'bidCount': FieldValue.increment(1),
@@ -246,7 +405,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
 
     await batch.commit();
 
-    // Notify buyer via Cloud Function
     try {
       await _fn.httpsCallable('onNewDeliveryBid').call({
         'jobId': jobId,
@@ -254,15 +412,56 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
         'amount': amount,
         'buyerId': buyerId,
       });
-    } catch (_) {
-      // Notification failure shouldn't fail the bid
-    }
+    } catch (_) {}
   }
 
   @override
   Future<void> withdrawBid(String bidId) async {
     await _db.collection('deliveryBids').doc(bidId).update({
       'status': BidStatus.withdrawn.name,
+    });
+  }
+
+  @override
+  Future<void> counterBid({
+    required String jobId,
+    required String bidId,
+    required String buyerId,
+    required double counterAmount,
+  }) async {
+    await _fn.httpsCallable('counterDeliveryBid').call({
+      'jobId': jobId,
+      'bidId': bidId,
+      'buyerId': buyerId,
+      'counterAmount': counterAmount,
+    });
+  }
+
+
+
+
+
+  @override
+  Future<void> respondToCounter({
+    required String bidId,
+    required String agentId,
+    required bool accept,
+  }) async {
+    await _fn.httpsCallable('respondToCounter').call({
+      'bidId': bidId,
+      'agentId': agentId,
+      'accept': accept,
+    });
+  }
+
+  @override
+  Future<void> cancelCounter({
+    required String bidId,
+    required String buyerId,
+  }) async {
+    await _fn.httpsCallable('cancelDeliveryCounter').call({
+      'bidId': bidId,
+      'buyerId': buyerId,
     });
   }
 
@@ -291,7 +490,7 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
     return DeliveryBid.fromMap(snap.docs.first.id, snap.docs.first.data());
   }
 
-  // ── Delivery Actions ─────────────────────────────────────
+  // ── Delivery Actions (Truust marketplace) ─────────────────
 
   @override
   Future<void> markPickedUp({
@@ -299,7 +498,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
     required String agentId,
     required File photo,
   }) async {
-    // Upload pickup photo
     final ref = _storage.ref('delivery/$jobId/pickup.jpg');
     await ref.putFile(photo);
     final photoUrl = await ref.getDownloadURL();
@@ -310,7 +508,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
       'pickupTime': FieldValue.serverTimestamp(),
     });
 
-    // Update tracking
     await _db.collection('deliveryTracking').doc(jobId).set({
       'agentId': agentId,
       'area': 'En route to pickup',
@@ -345,7 +542,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
     required String agentId,
     required File photo,
   }) async {
-    // Upload delivery photo
     final ref = _storage.ref('delivery/$jobId/delivery.jpg');
     await ref.putFile(photo);
     final photoUrl = await ref.getDownloadURL();
@@ -364,7 +560,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
       'lastUpdated': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
 
-    // Notify buyer to confirm receipt
     try {
       await _fn.httpsCallable('onDeliveryMarkedDelivered').call({
         'jobId': jobId,
@@ -380,7 +575,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
     final agent = await getAgent(agentId);
     if (agent == null) return {};
 
-    // Get completed deliveries this month
     final now = DateTime.now();
     final startOfMonth = DateTime(now.year, now.month, 1);
 
@@ -396,7 +590,6 @@ class DeliveryRepositoryImpl implements DeliveryRepository {
     for (final doc in snap.docs) {
       thisMonth += (doc.data()['agreedAmount'] as num?)?.toDouble() ?? 0;
     }
-    // Deduct 10% commission
     thisMonth *= 0.9;
 
     return {

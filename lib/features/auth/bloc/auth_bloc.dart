@@ -1,4 +1,5 @@
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
 import '../../../data/repositories/auth_repository.dart';
@@ -22,12 +23,18 @@ class VerifyOTPEvent extends AuthEvent {
 
 class SignOutEvent extends AuthEvent {}
 
+class ResetAuthEvent extends AuthEvent {}
+
+class SetAvailabilityEvent extends AuthEvent {
+  final bool isAvailable;
+  SetAvailabilityEvent(this.isAvailable);
+}
+
 // ── States ───────────────────────────────────────────────────
 abstract class AuthState {}
 
 class AuthInitial extends AuthState {}
 class AuthLoading extends AuthState {}
-
 class AuthUnauthenticated extends AuthState {}
 
 class OTPSent extends AuthState {
@@ -37,7 +44,6 @@ class OTPSent extends AuthState {
   OTPSent(this.verificationId, this.phoneNumber, {this.resendToken});
 }
 
-// User verified OTP — now check registration + verification status
 class AuthVerified extends AuthState {
   final User user;
   final bool isRegisteredAgent;
@@ -46,7 +52,6 @@ class AuthVerified extends AuthState {
       {required this.isRegisteredAgent, this.isVerified = false});
 }
 
-// Fully authenticated registered agent
 class AuthAuthenticated extends AuthState {
   final User user;
   AuthAuthenticated(this.user);
@@ -60,12 +65,15 @@ class AuthError extends AuthState {
 // ── Bloc ─────────────────────────────────────────────────────
 class AuthBloc extends Bloc<AuthEvent, AuthState> {
   final AuthRepository repository;
+  final _db = FirebaseFirestore.instance;
 
   AuthBloc({required this.repository}) : super(AuthInitial()) {
     on<CheckAuthEvent>(_onCheck);
     on<SendOTPEvent>(_onSendOTP);
     on<VerifyOTPEvent>(_onVerifyOTP);
     on<SignOutEvent>(_onSignOut);
+    on<SetAvailabilityEvent>(_onSetAvailability);
+    on<ResetAuthEvent>((event, emit) => emit(AuthInitial()));
   }
 
   Future<void> _onCheck(
@@ -74,6 +82,8 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
     if (user == null) {
       emit(AuthUnauthenticated());
     } else {
+      // Set available on app resume / restart
+      await _setAvailable(user.uid, true);
       emit(AuthAuthenticated(user));
     }
   }
@@ -104,6 +114,12 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
         event.verificationId,
         event.otp,
       );
+
+      // ── Set online when rider logs in ──────────────────────
+      if (result.isRegisteredAgent && result.isVerified) {
+        await _setAvailable(result.user.uid, true);
+      }
+
       emit(AuthVerified(
         result.user,
         isRegisteredAgent: result.isRegisteredAgent,
@@ -116,8 +132,34 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
 
   Future<void> _onSignOut(
       SignOutEvent event, Emitter<AuthState> emit) async {
+    // ── Set offline before signing out ─────────────────────
+    final user = repository.currentUser;
+    if (user != null) {
+      await _setAvailable(user.uid, false);
+    }
     await repository.signOut();
     emit(AuthUnauthenticated());
+  }
+
+  Future<void> _onSetAvailability(
+      SetAvailabilityEvent event, Emitter<AuthState> emit) async {
+    final user = repository.currentUser;
+    if (user == null) return;
+    await _setAvailable(user.uid, event.isAvailable);
+  }
+
+  // ── Helper ────────────────────────────────────────────────
+  Future<void> _setAvailable(String userId, bool isAvailable) async {
+    try {
+      final doc = await _db.collection('deliveryAgents').doc(userId).get();
+      if (!doc.exists) return; // not registered yet — skip
+      await _db.collection('deliveryAgents').doc(userId).update({
+        'isAvailable': isAvailable,
+        'lastSeen': FieldValue.serverTimestamp(),
+      });
+    } catch (_) {
+      // Non-critical — don't crash the app
+    }
   }
 
   String _friendly(Object e) {

@@ -146,12 +146,43 @@ class DeliveryVehicle {
   );
 }
 
+// ── Guarantor Model ──────────────────────────────────────────
+// Information on file only — no automated verification. Your
+// team calls these numbers manually only if something serious
+// comes up (dispute, missing rider, fraud concern).
+
+class Guarantor {
+  final String name;
+  final String phone;
+  final String relationship;
+
+  const Guarantor({
+    required this.name,
+    required this.phone,
+    required this.relationship,
+  });
+
+  Map<String, dynamic> toMap() => {
+    'name': name,
+    'phone': phone,
+    'relationship': relationship,
+  };
+
+  factory Guarantor.fromMap(Map<String, dynamic> m) => Guarantor(
+    name: m['name'] ?? '',
+    phone: m['phone'] ?? '',
+    relationship: m['relationship'] ?? '',
+  );
+}
+
 // ── Agent Model ──────────────────────────────────────────────
 
 class DeliveryAgent {
   final String userId;
   final String name;
   final String phone;
+  final String email;
+  final String homeAddress;
   final bool isVerified;
   final bool isAvailable;
   final String city;
@@ -159,12 +190,47 @@ class DeliveryAgent {
   final int totalDeliveries;
   final double totalEarnings;
   final List<DeliveryVehicle> vehicles;
+  final List<Guarantor> guarantors;
   final DateTime createdAt;
+  final String tier;
+
+  // Manual-review KYC fields. verificationStatus mirrors isVerified
+  // today (admin flips both together) but is kept as its own field
+  // so a future automated provider (Smile ID) can eventually set it
+  // to more granular states ('pending' | 'approved' | 'rejected')
+  // without a schema change.
+  final String idType; // 'drivers_license' | 'voters_card'
+  final String? idDocumentUrl;
+  final String? selfieUrl;
+  final String verificationStatus; // 'pending' | 'approved' | 'rejected'
+  final String? rejectionReason;
+
+  // Additional local-compliance documents (Abuja/AMAC operating
+  // requirements) — same manual-review model as idDocumentUrl/selfieUrl.
+  final String? riderPermitUrl;
+  final String? amacRegistrationUrl;
+  final String? bikeWithPlateUrl;
+
+  // Fleet SaaS linkage. agencyId is only ever set by the admin
+  // (approveRiderVerification) once the code the rider entered is
+  // confirmed against a real agency — never trusted from client input
+  // directly. agencyCodeEntered is what the rider actually typed,
+  // kept for the admin to cross-check at review time.
+  final String? agencyId;
+  final String? agencyCodeEntered;
+
+  // Rider's own profile picture — cosmetic only, shown on the
+  // rider's own app UI. Never shown to customers; selfieUrl (the
+  // verification capture) is the only customer-facing identity
+  // photo and this field never overrides it.
+  final String? profilePhotoUrl;
 
   const DeliveryAgent({
     required this.userId,
     required this.name,
     required this.phone,
+    this.email = '',
+    this.homeAddress = '',
     required this.isVerified,
     required this.isAvailable,
     required this.city,
@@ -172,7 +238,20 @@ class DeliveryAgent {
     required this.totalDeliveries,
     required this.totalEarnings,
     required this.vehicles,
+    this.guarantors = const [],
     required this.createdAt,
+    this.tier = 'bronze',
+    this.idType = '',
+    this.idDocumentUrl,
+    this.selfieUrl,
+    this.verificationStatus = 'pending',
+    this.rejectionReason,
+    this.riderPermitUrl,
+    this.amacRegistrationUrl,
+    this.bikeWithPlateUrl,
+    this.agencyId,
+    this.agencyCodeEntered,
+    this.profilePhotoUrl,
   });
 
   // Agent is pending if registered but not yet verified
@@ -192,24 +271,49 @@ class DeliveryAgent {
         userId: userId,
         name: m['name'] ?? '',
         phone: m['phone'] ?? '',
+        email: m['email'] ?? '',
+        homeAddress: m['homeAddress'] ?? '',
         isVerified: m['isVerified'] ?? false,
         isAvailable: m['isAvailable'] ?? true,
         city: m['city'] ?? '',
-        rating: (m['rating'] as num?)?.toDouble() ?? 5.0,
+        // Tier progression (rewards.js) reads 'avgRating', not
+        // 'rating' — fall back to 'rating' for older docs that
+        // were only ever written with the old field name.
+        rating: (m['avgRating'] as num?)?.toDouble() ??
+            (m['rating'] as num?)?.toDouble() ??
+            5.0,
         totalDeliveries: (m['totalDeliveries'] as num?)?.toInt() ?? 0,
         totalEarnings: (m['totalEarnings'] as num?)?.toDouble() ?? 0,
         vehicles: (m['vehicles'] as List<dynamic>?)
             ?.map((v) => DeliveryVehicle.fromMap(Map<String, dynamic>.from(v)))
             .toList() ??
             [],
+        guarantors: (m['guarantors'] as List<dynamic>?)
+            ?.map((g) => Guarantor.fromMap(Map<String, dynamic>.from(g)))
+            .toList() ??
+            [],
         createdAt: m['createdAt'] != null
             ? (m['createdAt'] as Timestamp).toDate()
             : DateTime.now(),
+        // Written by the backend's rewards.js (updateRiderTier /
+        // onRiderRegistered) — defaults to 'bronze' for any agent
+        // doc that predates the tier system.
+        tier: m['tier'] as String? ?? 'bronze',
+        idType: m['idType'] as String? ?? '',
+        idDocumentUrl: m['idDocumentUrl'] as String?,
+        selfieUrl: m['selfieUrl'] as String?,
+        verificationStatus: m['verificationStatus'] as String? ?? 'pending',
+        rejectionReason: m['rejectionReason'] as String?,
+        riderPermitUrl: m['riderPermitUrl'] as String?,
+        amacRegistrationUrl: m['amacRegistrationUrl'] as String?,
+        bikeWithPlateUrl: m['bikeWithPlateUrl'] as String?,
+        agencyId: m['agencyId'] as String?,
+        agencyCodeEntered: m['agencyCodeEntered'] as String?,
+        profilePhotoUrl: m['profilePhotoUrl'] as String?,
       );
 }
 
 // ── Job Model ────────────────────────────────────────────────
-
 class DeliveryJob {
   final String id;
   final String orderId;
@@ -428,5 +532,94 @@ class DeliveryTracking {
     lastUpdated: m['lastUpdated'] != null
         ? (m['lastUpdated'] as Timestamp).toDate()
         : DateTime.now(),
+  );
+}
+
+
+
+// ── Fleet Order Model ────────────────────────────────────────
+// An agency's own privately-dispatched delivery — completely
+// separate from the Truust marketplace (DeliveryJob above). No
+// bidding, no escrow, no OTP: the manager already decided who does
+// this job, so it goes straight to Active with a simpler
+// pickup → in transit → photo-proof-and-deliver flow.
+
+class FleetOrderStop {
+  final String address;
+  final bool completed;
+  const FleetOrderStop({required this.address, required this.completed});
+
+  factory FleetOrderStop.fromMap(Map<String, dynamic> m) => FleetOrderStop(
+    address: m['address'] ?? '',
+    completed: m['completed'] ?? false,
+  );
+}
+
+class FleetOrder {
+  final String id;
+  final String agencyId;
+  final String customerName;
+  final String customerPhone;
+  final String pickupAddress;
+  final String dropoffAddress;
+  // Coordinates are optional — only present once the agency
+  // dashboard's dispatch form captures them via address autocomplete.
+  // Null until that's wired up; the tracking page falls back to
+  // address-text navigation when these are absent.
+  final double? pickupLat;
+  final double? pickupLng;
+  final double? dropoffLat;
+  final double? dropoffLng;
+  final List<FleetOrderStop> extraStops;
+  final double fee;
+  final String status; // pending | assigned | in_transit | delivered | cancelled
+  final String? proofPhotoUrl;
+  final DateTime? scheduledFor;
+  final DateTime? createdAt;
+  final DateTime? assignedAt;
+  final DateTime? deliveredAt;
+
+  const FleetOrder({
+    required this.id,
+    required this.agencyId,
+    required this.customerName,
+    required this.customerPhone,
+    required this.pickupAddress,
+    required this.dropoffAddress,
+    this.pickupLat,
+    this.pickupLng,
+    this.dropoffLat,
+    this.dropoffLng,
+    required this.extraStops,
+    required this.fee,
+    required this.status,
+    this.proofPhotoUrl,
+    this.scheduledFor,
+    this.createdAt,
+    this.assignedAt,
+    this.deliveredAt,
+  });
+
+  factory FleetOrder.fromMap(String id, Map<String, dynamic> m) => FleetOrder(
+    id: id,
+    agencyId: m['agencyId'] ?? '',
+    customerName: m['customerName'] ?? 'Customer',
+    customerPhone: m['customerPhone'] ?? '',
+    pickupAddress: m['pickupAddress'] ?? '',
+    dropoffAddress: m['dropoffAddress'] ?? '',
+    pickupLat: (m['pickupLat'] as num?)?.toDouble(),
+    pickupLng: (m['pickupLng'] as num?)?.toDouble(),
+    dropoffLat: (m['dropoffLat'] as num?)?.toDouble(),
+    dropoffLng: (m['dropoffLng'] as num?)?.toDouble(),
+    extraStops: (m['extraStops'] as List<dynamic>?)
+        ?.map((s) => FleetOrderStop.fromMap(Map<String, dynamic>.from(s)))
+        .toList() ?? [],
+    fee: (m['fee'] as num?)?.toDouble() ?? 0,
+    status: m['status'] ?? 'assigned',
+    proofPhotoUrl: m['proofPhotoUrl'] as String?,
+    scheduledFor: m['scheduledFor'] != null ? (m['scheduledFor'] as Timestamp).toDate() : null,
+    createdAt: m['createdAt'] != null ? (m['createdAt'] as Timestamp).toDate() : null,
+    assignedAt: m['assignedAt'] != null ? (m['assignedAt'] as Timestamp).toDate() : null,
+    deliveredAt: m['deliveredAt'] != null ? (m['deliveredAt'] as Timestamp).toDate() : null,
   );
 }

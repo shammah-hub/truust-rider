@@ -72,16 +72,6 @@ class AuthRepositoryImpl implements AuthRepository {
     final isRegisteredAgent = agentDoc.exists;
     final isVerified = agentDoc.data()?['isVerified'] == true;
 
-    // Create stub user doc if first time
-    final userDoc = await _db.collection('users').doc(user.uid).get();
-    if (!userDoc.exists) {
-      await _db.collection('users').doc(user.uid).set({
-        'phoneNumber': user.phoneNumber,
-        'createdAt': FieldValue.serverTimestamp(),
-        'isDeliveryAgent': false,
-      });
-    }
-
     return (user: user, isRegisteredAgent: isRegisteredAgent, isVerified: isVerified);
   }
 
